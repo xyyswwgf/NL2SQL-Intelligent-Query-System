@@ -1,0 +1,42 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+frontend/node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Root-level misc (not part of project)
+/main.py
+/package.json
+/package-lock.json
+
+# Data — 包含真实数据的CSV文件不要提交
+*.xls
+*.xlsx
+本科毕业生毕业资格审核表.csv
+
+# Env
+.env
+*.local
+
+# Docker
+mysql_data/
+
+# Claude
+.claude/

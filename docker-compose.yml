@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: nl2sql-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: Simple@123
+      MYSQL_DATABASE: nl2sql_db
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./backend/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+      - mysql_data:/var/lib/mysql
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pSimple@123"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  mysql_data:
