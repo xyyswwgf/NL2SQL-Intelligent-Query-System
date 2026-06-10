@@ -26,22 +26,32 @@ import logging
 import re
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from backend.llm_service import generate_sql
 from backend.sql_guard import validate_sql
-from backend.database import execute_sql, get_ddl, table_exists, drop_table
+from backend.database import (
+    execute_sql,
+    get_table_names,
+    quote_identifier,
+    table_exists,
+    drop_table,
+)
 from backend.csv_importer import (
     parse_csv,
     sanitize_column_name,
     infer_column_types,
+    profile_import_file,
     create_table,
     insert_rows,
     derive_table_name,
     auto_detect_trailing_rows,
     auto_detect_header_row,
 )
-from backend.config import CSV_MAX_FILE_SIZE_MB, CSV_MAX_ROWS, CSV_BATCH_SIZE
+from backend.agent_service import run_analysis, list_history, get_history_detail, export_report
+from backend.generic_table_agent import run_table_analysis
+from backend.config import CSV_MAX_FILE_SIZE_MB, CSV_MAX_ROWS, CSV_BATCH_SIZE, DB_HOST, DB_PORT, DB_NAME
 
 # ---------------------------------------------------------------------------
 # 日志配置
@@ -136,6 +146,47 @@ class DeleteResponse(BaseModel):
     message: str = Field(..., description="操作结果描述")
 
 
+class AnalyzeRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=500)
+    analysis_mode: str = Field("auto", description="分析模式，当前默认 auto")
+
+
+class TableAnalyzeRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=500)
+    table_name: str = Field(..., min_length=1, max_length=128)
+    analysis_mode: str = Field("auto", description="分析模式，当前默认 auto")
+
+
+def _load_table_details() -> list[dict]:
+    """Load table metadata using PostgreSQL-safe identifier quoting."""
+    table_details = []
+    for table_name in get_table_names():
+        quoted_table = quote_identifier(table_name)
+        result = execute_sql(f"SELECT COUNT(*) AS cnt FROM {quoted_table}")
+        row_count = result["data"][0][0] if result["data"] else 0
+
+        imported = table_name.startswith("csv_")
+        imported_at = None
+        if imported:
+            try:
+                time_result = execute_sql(
+                    f"SELECT MIN(\"_imported_at\") AS t FROM {quoted_table}"
+                )
+                raw = time_result["data"][0][0] if time_result["data"] else None
+                if raw:
+                    imported_at = str(raw)
+            except Exception:
+                pass
+
+        table_details.append({
+            "table_name": table_name,
+            "row_count": row_count,
+            "imported": imported,
+            "imported_at": imported_at,
+        })
+    return table_details
+
+
 # ---------------------------------------------------------------------------
 # 中间件：请求日志
 # ---------------------------------------------------------------------------
@@ -181,52 +232,19 @@ async def data_source_info():
     """
     数据来源信息 — 告诉前端数据库里有什么、数据从哪来
     """
-    ddl = get_ddl()
-    # 从 DDL 中提取表名
-    tables = re.findall(r"CREATE TABLE `(\w+)`", ddl)
-
-    # 获取每个表的行数和导入状态
-    table_details = []
-    for table_name in tables:
-        result = execute_sql(f"SELECT COUNT(*) AS cnt FROM `{table_name}`")
-        row_count = result["data"][0][0] if result["data"] else 0
-
-        # 检测是否为导入表（csv_ 前缀或有 _imported_at 列）
-        imported = False
-        imported_at = None
-        if table_name.startswith("csv_"):
-            imported = True
-            # 尝试获取导入时间
-            try:
-                time_result = execute_sql(
-                    f"SELECT MIN(_imported_at) AS t FROM `{table_name}`"
-                )
-                raw = time_result["data"][0][0] if time_result["data"] else None
-                if raw:
-                    imported_at = str(raw)
-            except Exception:
-                pass
-
-        table_details.append({
-            "table_name": table_name,
-            "row_count": row_count,
-            "imported": imported,
-            "imported_at": imported_at,
-        })
-
     return {
         "database": {
-            "engine": "MySQL 8.0",
-            "host": "localhost:3306",
-            "name": "nl2sql_db",
-            "charset": "utf8mb4",
+            "engine": "PostgreSQL 16",
+            "host": f"{DB_HOST}:{DB_PORT}",
+            "name": DB_NAME,
+            "charset": "UTF8",
         },
-        "tables": table_details,
+        "tables": _load_table_details(),
         "pipeline": [
             {"step": 1, "actor": "用户", "action": "输入自然语言问题"},
             {"step": 2, "actor": "LLM 大模型", "action": "结合数据库 DDL 结构生成 SQL"},
             {"step": 3, "actor": "安全网关", "action": "校验 SQL，拦截危险操作"},
-            {"step": 4, "actor": "MySQL", "action": "执行 SELECT 查询"},
+            {"step": 4, "actor": "PostgreSQL", "action": "执行 SELECT 查询"},
             {"step": 5, "actor": "前端", "action": "表格展示 + ECharts 智能图表"},
         ],
     }
@@ -260,7 +278,7 @@ async def natural_language_query(req: QueryRequest):
                    ▼
     ┌─────────────────────────────┐
     │ Step 3: 执行查询            │  ← database.execute_sql()
-    │   - 连接 MySQL              │
+    │   - 连接 PostgreSQL         │
     │   - 执行 SELECT             │
     │   - 格式化为 JSON           │
     └──────────────┬──────────────┘
@@ -323,6 +341,71 @@ async def natural_language_query(req: QueryRequest):
         columns=result["columns"],
         data=result["data"],
         row_count=result["row_count"],
+    )
+
+
+@app.post("/api/analyze")
+async def analyze_business_question(req: AnalyzeRequest):
+    """
+    数据智能 Agent 分析接口。
+
+    该接口面向经营分析问题，会自动执行规划、知识检索、多条 SQL 查询、
+    指标计算、归因分析、图表生成和报告输出。
+    """
+    question = req.question.strip()
+    logger.info("收到 Agent 分析请求: %s", question)
+    try:
+        return run_analysis(question, req.analysis_mode)
+    except Exception as exc:
+        logger.error("Agent 分析失败: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Agent 分析失败: {str(exc)}")
+
+
+@app.post("/api/analyze/table")
+async def analyze_imported_table(req: TableAnalyzeRequest):
+    """
+    CSV 导入表通用分析接口。
+
+    该接口只允许分析 csv_ 前缀的导入表，会自动识别字段角色并生成只读 SQL、
+    图表和结构化报告。
+    """
+    question = req.question.strip()
+    table_name = req.table_name.strip()
+    logger.info("收到 CSV 表 Agent 分析请求: %s / %s", table_name, question)
+    try:
+        return run_table_analysis(question, table_name, req.analysis_mode)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        logger.error("CSV 表 Agent 分析失败: %s", exc)
+        raise HTTPException(status_code=500, detail=f"CSV 表 Agent 分析失败: {str(exc)}")
+
+
+@app.get("/api/analysis/history")
+async def analysis_history():
+    return {"items": list_history()}
+
+
+@app.get("/api/analysis/{run_id}")
+async def analysis_detail(run_id: str):
+    detail = get_history_detail(run_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"分析记录 {run_id} 不存在")
+    return detail
+
+
+@app.get("/api/analysis/{run_id}/export")
+async def analysis_export(run_id: str, format: str = Query("markdown", pattern="^(markdown|html)$")):
+    exported = export_report(run_id, format)
+    if not exported:
+        raise HTTPException(status_code=404, detail=f"分析记录 {run_id} 不存在")
+    content, media_type, filename = exported
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -393,6 +476,15 @@ async def preview_csv(
     used_names = set()
     clean_headers = [sanitize_column_name(h, used_names) for h in headers]
     column_types = infer_column_types(clean_headers, rows)
+    file_profile = profile_import_file(
+        original_filename if "original_filename" in locals() else (file.filename or "unknown.csv"),
+        headers,
+        clean_headers,
+        rows,
+        column_types,
+        encoding,
+        delimiter=",",
+    )
 
     # ── 每列的样本值 ──
     preview_count = min(20, len(rows))
@@ -423,6 +515,7 @@ async def preview_csv(
         "clean_headers": clean_headers,
         "columns": columns_info,
         "preview_rows": preview_rows,
+        "file_profile": file_profile,
     }
 
 
@@ -549,37 +642,11 @@ async def list_tables(imported_only: bool = Query(False, description="仅显示�
 
     可用于前端展示表列表，区分原始表和导入表。
     """
-    # 复用 /api/info 的表发现逻辑
-    ddl = get_ddl()
-    tables = re.findall(r"CREATE TABLE `(\w+)`", ddl)
-
-    table_list = []
-    for table_name in tables:
-        result = execute_sql(f"SELECT COUNT(*) AS cnt FROM `{table_name}`")
-        row_count = result["data"][0][0] if result["data"] else 0
-
-        imported = table_name.startswith("csv_")
-        imported_at = None
-        if imported:
-            try:
-                time_result = execute_sql(
-                    f"SELECT MIN(_imported_at) AS t FROM `{table_name}`"
-                )
-                raw = time_result["data"][0][0] if time_result["data"] else None
-                if raw:
-                    imported_at = str(raw)
-            except Exception:
-                pass
-
-        if imported_only and not imported:
-            continue
-
-        table_list.append(TableInfo(
-            table_name=table_name,
-            row_count=row_count,
-            imported=imported,
-            imported_at=imported_at,
-        ))
+    table_list = [
+        TableInfo(**table)
+        for table in _load_table_details()
+        if not imported_only or table["imported"]
+    ]
 
     return TableListResponse(tables=table_list)
 

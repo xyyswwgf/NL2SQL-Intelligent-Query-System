@@ -52,6 +52,43 @@ export async function queryNL(question) {
 }
 
 /**
+ * 发送经营分析问题，获取 Agent 工作流结果。
+ *
+ * @param {string} question
+ * @param {string} analysisMode
+ */
+export async function analyzeQuestion(question, analysisMode = "auto") {
+  const response = await apiClient.post("/api/analyze", {
+    question,
+    analysis_mode: analysisMode,
+  }, {
+    timeout: 120000,
+  });
+  return response.data;
+}
+
+export async function analyzeTableQuestion(tableName, question, analysisMode = "auto") {
+  const response = await apiClient.post("/api/analyze/table", {
+    table_name: tableName,
+    question,
+    analysis_mode: analysisMode,
+  }, {
+    timeout: 120000,
+  });
+  return response.data;
+}
+
+export async function getAnalysisHistory() {
+  const response = await apiClient.get("/api/analysis/history");
+  return response.data;
+}
+
+export async function getAnalysisDetail(runId) {
+  const response = await apiClient.get(`/api/analysis/${runId}`);
+  return response.data;
+}
+
+/**
  * 健康检查 — 验证后端服务是否正常运行
  *
  * @returns {Promise<{status: string, service: string, version: string}>}

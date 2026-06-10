@@ -65,9 +65,9 @@ _DANGEROUS_PATTERNS: list[tuple[str, str]] = [
     (r"\bBENCHMARK\b", "BENCHMARK（性能测试函数，常用于盲注）"),
 ]
 
-# SELECT 语句特征模式 — 允许 WITH（CTE）和 EXPLAIN 前缀
+# SELECT 语句特征模式 — 允许 SELECT、EXPLAIN SELECT 和 PostgreSQL CTE
 _SELECT_HEAD_PATTERN = re.compile(
-    r"^(WITH\s+|EXPLAIN\s+)?SELECT\b",
+    r"^(SELECT\b|EXPLAIN\s+SELECT\b|WITH\b[\s\S]+\bSELECT\b)",
     re.IGNORECASE,
 )
 

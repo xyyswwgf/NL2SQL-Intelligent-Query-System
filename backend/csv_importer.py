@@ -14,7 +14,7 @@ CSV 导入引擎 — 解析、类型推断、建表、批量写入
 安全设计:
   - 所有 SQL 由服务端构造，不经过 sql_guard
   - 列名和表名经过清理 + backtick 包裹
-  - 数据值通过 PyMySQL executemany 参数化传递
+  - 数据值通过 SQLAlchemy executemany 参数化传递
 ================================================================================
 """
 
@@ -23,7 +23,7 @@ import io
 import re
 import datetime
 import logging
-from backend.database import execute_ddl, execute_insert
+from backend.database import execute_ddl, execute_insert, quote_identifier
 
 logger = logging.getLogger("nl2sql.csv_importer")
 
@@ -264,13 +264,128 @@ def infer_column_types(headers: list[str], rows: list[list[str]], overrides: dic
         elif _try_date(non_null):
             results.append({"name": col_name, "type": "DATE", "nullable": has_null, "max_len": max_blen})
         elif _try_datetime(non_null):
-            results.append({"name": col_name, "type": "DATETIME", "nullable": has_null, "max_len": max_blen})
+            results.append({"name": col_name, "type": "TIMESTAMP", "nullable": has_null, "max_len": max_blen})
         else:
             vlen = max(int(max_blen * _UTF8MB4_BYTE_FACTOR * 0.8), _MIN_VARCHAR_LEN)
             vlen = min(vlen, _MAX_VARCHAR_LEN)
             results.append({"name": col_name, "type": f"VARCHAR({vlen})", "nullable": has_null, "max_len": vlen})
 
     return results
+
+
+def profile_import_file(
+    filename: str,
+    headers: list[str],
+    clean_headers: list[str],
+    rows: list[list[str]],
+    column_types: list[dict],
+    encoding: str,
+    delimiter: str,
+) -> dict:
+    """Infer import intent, likely primary keys, semantic columns, and quality hints."""
+    lower_name = filename.lower()
+    file_type = "csv" if lower_name.endswith(".csv") else "unknown"
+    total_rows = len(rows)
+    total_cols = len(clean_headers)
+
+    primary_key_candidates = []
+    for idx, col in enumerate(clean_headers):
+        values = [row[idx].strip() for row in rows if idx < len(row)]
+        non_empty = [v for v in values if v.strip().lower() not in _NULL_MARKERS]
+        unique_count = len(set(non_empty))
+        uniqueness = unique_count / len(non_empty) if non_empty else 0
+        score = 0
+        normalized = col.lower()
+        id_like = False
+        if normalized in {"id", "_id"} or normalized.endswith("_id"):
+            id_like = True
+            score += 0.35
+        if any(token in col for token in ("编号", "编码", "代码", "单号", "学号", "工号", "ID", "id")):
+            id_like = True
+            score += 0.35
+        first_column_unique = idx == 0 and uniqueness >= 0.98 and len(non_empty) == total_rows
+        if uniqueness >= 0.98 and len(non_empty) == total_rows:
+            score += 0.45
+        if first_column_unique and not id_like:
+            score = max(score, 0.55)
+        score = min(score, 1.0)
+        if id_like or first_column_unique:
+            primary_key_candidates.append({
+                "column": col,
+                "score": round(score, 2),
+                "unique_count": unique_count,
+                "non_empty_count": len(non_empty),
+                "reason": "字段名像主键且值基本唯一" if uniqueness >= 0.98 else "字段名像主键",
+            })
+
+    primary_key_candidates.sort(key=lambda item: item["score"], reverse=True)
+
+    semantic_columns = []
+    for col, col_type in zip(clean_headers, column_types):
+        semantic = _guess_semantic_type(col, col_type["type"])
+        if semantic:
+            semantic_columns.append({
+                "column": col,
+                "semantic_type": semantic,
+                "db_type": col_type["type"],
+            })
+
+    empty_cells = 0
+    total_cells = max(total_rows * total_cols, 1)
+    duplicate_rows = 0
+    seen_rows = set()
+    for row in rows:
+        normalized_row = tuple(row[:total_cols])
+        if normalized_row in seen_rows:
+            duplicate_rows += 1
+        seen_rows.add(normalized_row)
+        empty_cells += sum(1 for cell in row[:total_cols] if cell.strip().lower() in _NULL_MARKERS)
+
+    warnings = []
+    if not primary_key_candidates:
+        warnings.append("未发现高置信主键列，导入时将使用自动行号 _id。")
+    if duplicate_rows:
+        warnings.append(f"检测到 {duplicate_rows} 行重复记录。")
+    if empty_cells / total_cells > 0.15:
+        warnings.append("空值比例较高，建议导入前确认缺失值含义。")
+    if total_cols > 30:
+        warnings.append("列数较多，建议确认是否存在多行表头或宽表拆分需求。")
+
+    return {
+        "file_type": file_type,
+        "encoding": encoding,
+        "delimiter": delimiter,
+        "row_count": total_rows,
+        "column_count": total_cols,
+        "primary_key_candidates": primary_key_candidates[:3],
+        "recommended_primary_key": primary_key_candidates[0]["column"] if primary_key_candidates else None,
+        "semantic_columns": semantic_columns,
+        "quality": {
+            "empty_cell_ratio": round(empty_cells / total_cells, 4),
+            "duplicate_rows": duplicate_rows,
+        },
+        "warnings": warnings,
+        "suggested_table_name": derive_table_name(filename),
+    }
+
+
+def _guess_semantic_type(column_name: str, db_type: str) -> str | None:
+    name = column_name.lower()
+    if any(token in column_name for token in ("日期", "时间")) or "date" in name or "time" in name:
+        return "date_or_time"
+    if any(token in column_name for token in ("金额", "销售额", "收入", "价格", "费用", "成本")) or any(token in name for token in ("amount", "price", "cost", "sales")):
+        return "money"
+    if any(token in column_name for token in ("数量", "人数", "次数", "库存")) or any(token in name for token in ("count", "qty", "quantity", "stock")):
+        return "quantity"
+    if any(token in column_name for token in ("地区", "省", "市", "城市", "区域")) or any(token in name for token in ("region", "province", "city")):
+        return "geo"
+    if any(token in column_name for token in ("渠道", "来源")) or "channel" in name:
+        return "channel"
+    if any(token in column_name for token in ("类别", "品类", "类型", "状态")) or any(token in name for token in ("category", "type", "status")):
+        return "category"
+    if "INT" in db_type or "DECIMAL" in db_type:
+        return "numeric"
+    return None
 
 
 def _try_int(vals):
@@ -331,19 +446,18 @@ def create_table(table_name: str, columns: list[dict], primary_key_column: str |
         for col in columns:
             nc = "NOT NULL" if col["name"] == primary_key_column else "DEFAULT NULL"
             pk = "PRIMARY KEY" if col["name"] == primary_key_column else ""
-            col_defs.append(f"`{col['name']}` {col['type']} {nc} {pk} COMMENT '导入列'".strip())
+            col_defs.append(f"{quote_identifier(col['name'])} {col['type']} {nc} {pk}".strip())
         pk_added = True
     else:
-        col_defs.append("`_id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY COMMENT '自动行号'")
+        col_defs.append('"_id" INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY')
         for col in columns:
             null_clause = "DEFAULT NULL" if col.get("nullable", True) else "NOT NULL"
-            col_defs.append(f"`{col['name']}` {col['type']} {null_clause} COMMENT '导入列'")
+            col_defs.append(f"{quote_identifier(col['name'])} {col['type']} {null_clause}")
 
     if not pk_added:
-        col_defs.append("`_imported_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '导入时间'")
+        col_defs.append('"_imported_at" TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP')
 
-    ddl = f"CREATE TABLE `{table_name}` (\n  " + ",\n  ".join(col_defs) + \
-          f"\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='CSV导入表'"
+    ddl = f"CREATE TABLE {quote_identifier(table_name)} (\n  " + ",\n  ".join(col_defs) + "\n)"
     logger.info("DDL: %s", ddl[:300])
     execute_ddl(ddl)
 
@@ -351,13 +465,17 @@ def create_table(table_name: str, columns: list[dict], primary_key_column: str |
 def insert_rows(table_name: str, headers: list[str], rows: list[list[str]], batch_size: int = 500) -> int:
     if not rows:
         return 0
-    ph = ", ".join(["%s"] * len(headers))
-    cs = ", ".join(f"`{h}`" for h in headers)
-    sql = f"INSERT INTO `{table_name}` ({cs}) VALUES ({ph})"
+    cs = ", ".join(quote_identifier(h) for h in headers)
+    ph = ", ".join(f":col_{i}" for i in range(len(headers)))
+    sql = f"INSERT INTO {quote_identifier(table_name)} ({cs}) VALUES ({ph})"
     total = 0
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
-        params = [tuple(row) for row in batch]
+        params = [
+            {f"col_{idx}": (value if value.strip().lower() not in _NULL_MARKERS else None)
+             for idx, value in enumerate(row)}
+            for row in batch
+        ]
         total += execute_insert(sql, params)
         logger.info("已插入 %d/%d 行 → %s", total, len(rows), table_name)
     return total

@@ -7,7 +7,7 @@ import { importCsv, previewCsv, getTables, deleteTable } from "../api";
  * 流程: 选择文件 → 预览解析结果 → 调整列名/类型/主键 → 确认导入
  */
 
-const TYPE_OPTIONS = ["INT", "DECIMAL(10,2)", "DATE", "DATETIME", "VARCHAR(100)", "VARCHAR(200)", "VARCHAR(500)"];
+const TYPE_OPTIONS = ["INT", "DECIMAL(10,2)", "DATE", "TIMESTAMP", "VARCHAR(100)", "VARCHAR(200)", "VARCHAR(500)"];
 
 function formatTime(dateStr) {
   if (!dateStr) return "";
@@ -25,8 +25,8 @@ function CsvPreviewModal({ preview, file, onConfirm, onCancel, onRefresh, import
   const [columnConfig, setColumnConfig] = useState(() =>
     preview.columns.map((c) => ({ name: c.name, type: c.detected_type }))
   );
-  const [primaryKey, setPrimaryKey] = useState("");
-  const [tableAlias, setTableAlias] = useState("");
+  const [primaryKey, setPrimaryKey] = useState(preview.file_profile?.recommended_primary_key || "");
+  const [tableAlias, setTableAlias] = useState(preview.file_profile?.suggested_table_name || "");
   const [headerRow, setHeaderRow] = useState(preview.header_row || 1);
   const [dataStartRow, setDataStartRow] = useState(preview.data_start_row || 2);
   const [combineHeaders, setCombineHeaders] = useState(preview.combine_header_rows || 1);
@@ -35,6 +35,8 @@ function CsvPreviewModal({ preview, file, onConfirm, onCancel, onRefresh, import
   // 当 preview 数据刷新时，同步更新状态
   useEffect(() => {
     setColumnConfig(preview.columns.map((c) => ({ name: c.name, type: c.detected_type })));
+    setPrimaryKey(preview.file_profile?.recommended_primary_key || "");
+    setTableAlias(preview.file_profile?.suggested_table_name || "");
     setHeaderRow(preview.header_row || 1);
     setDataStartRow(preview.data_start_row || 2);
     setCombineHeaders(preview.combine_header_rows || 1);
@@ -93,6 +95,48 @@ function CsvPreviewModal({ preview, file, onConfirm, onCancel, onRefresh, import
             <span>🔤 {preview.encoding.toUpperCase()}</span>
           </div>
         </div>
+
+        {preview.file_profile && (
+          <div className="file-profile">
+            <div className="profile-card">
+              <span>文件类型</span>
+              <strong>{preview.file_profile.file_type.toUpperCase()}</strong>
+            </div>
+            <div className="profile-card">
+              <span>推荐主键</span>
+              <strong>{preview.file_profile.recommended_primary_key || "自动 _id"}</strong>
+            </div>
+            <div className="profile-card">
+              <span>建议表名</span>
+              <strong>{preview.file_profile.suggested_table_name}</strong>
+            </div>
+            <div className="profile-card">
+              <span>空值比例</span>
+              <strong>{(preview.file_profile.quality.empty_cell_ratio * 100).toFixed(2)}%</strong>
+            </div>
+            {preview.file_profile.primary_key_candidates?.length > 0 && (
+              <div className="profile-wide">
+                <strong>主键候选：</strong>
+                {preview.file_profile.primary_key_candidates.map((item) => (
+                  <span key={item.column}>
+                    {item.column} ({Math.round(item.score * 100)}%)
+                  </span>
+                ))}
+              </div>
+            )}
+            {preview.file_profile.semantic_columns?.length > 0 && (
+              <div className="profile-wide">
+                <strong>语义列：</strong>
+                {preview.file_profile.semantic_columns.slice(0, 8).map((item) => (
+                  <span key={item.column}>{item.column}: {item.semantic_type}</span>
+                ))}
+              </div>
+            )}
+            {preview.file_profile.warnings?.map((warning) => (
+              <div className="profile-warning" key={warning}>{warning}</div>
+            ))}
+          </div>
+        )}
 
         {/* ── 列配置 ── */}
         <div className="preview-col-config">
@@ -268,7 +312,7 @@ function ConflictDialog({ tableName, onOverwrite, onRename, onCancel }) {
 // 导入历史
 // ═══════════════════════════════════════════════════════════════
 
-function ImportHistory({ tables, onDelete, onQueryTable, loading }) {
+function ImportHistory({ tables, onDelete, onQueryTable, onAnalyzeTable, loading }) {
   if (!tables || tables.length === 0) return null;
   return (
     <div className="import-history">
@@ -286,6 +330,7 @@ function ImportHistory({ tables, onDelete, onQueryTable, loading }) {
           </div>
           <div className="history-actions">
             <button className="btn-query" onClick={() => onQueryTable(t.table_name)}>🔍 查询</button>
+            <button className="btn-analyze" onClick={() => onAnalyzeTable(t.table_name)}>Agent 分析</button>
             <button className="delete-btn" onClick={() => onDelete(t.table_name)} disabled={loading}>🗑️</button>
           </div>
         </div>
@@ -298,7 +343,7 @@ function ImportHistory({ tables, onDelete, onQueryTable, loading }) {
 // 主组件
 // ═══════════════════════════════════════════════════════════════
 
-export default function CsvUploader({ onImportComplete, onQueryTable }) {
+export default function CsvUploader({ onImportComplete, onQueryTable, onAnalyzeTable }) {
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -429,7 +474,11 @@ export default function CsvUploader({ onImportComplete, onQueryTable }) {
   };
 
   const handleQueryTable = (tableName) => {
-    if (onQueryTable) onQueryTable(`查看 ${tableName} 表的所有数据`);
+    if (onQueryTable) onQueryTable(tableName);
+  };
+
+  const handleAnalyzeTable = (tableName) => {
+    if (onAnalyzeTable) onAnalyzeTable(tableName);
   };
 
   return (
@@ -472,6 +521,7 @@ export default function CsvUploader({ onImportComplete, onQueryTable }) {
               </div>
               <div className="success-actions">
                 <button className="btn-primary" onClick={() => handleQueryTable(result.table_name)}>🔍 查询这张表</button>
+                <button className="btn-secondary" onClick={() => handleAnalyzeTable(result.table_name)}>Agent 分析</button>
                 <button className="btn-secondary" onClick={() => setResult(null)}>📤 继续上传</button>
               </div>
             </div>
@@ -485,7 +535,13 @@ export default function CsvUploader({ onImportComplete, onQueryTable }) {
           </div>
         )}
 
-        <ImportHistory tables={importedTables} onDelete={handleDelete} onQueryTable={handleQueryTable} loading={deleting} />
+        <ImportHistory
+          tables={importedTables}
+          onDelete={handleDelete}
+          onQueryTable={handleQueryTable}
+          onAnalyzeTable={handleAnalyzeTable}
+          loading={deleting}
+        />
       </div>
 
       {/* 预览弹窗 */}

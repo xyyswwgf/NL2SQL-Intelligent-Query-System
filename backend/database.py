@@ -1,240 +1,168 @@
 """
-=============================================================================
-数据库连接管理 — MySQL 交互层
-=============================================================================
+PostgreSQL data access layer.
 
-职责:
-  1. get_ddl()      — 提取所有表的建表语句，作为 LLM Prompt 的元数据上下文
-  2. execute_sql()  — 执行已通过安全校验的 SELECT 语句，返回结构化数据
-
-设计说明:
-  - 每次查询创建新连接（短连接模式），避免连接池在低负载下的维护成本
-  - 使用 DictCursor，查询结果直接为 dict 而非 tuple，便于提取列名
-  - 生产环境建议改为 SQLAlchemy 连接池 + 环境变量配置
-=============================================================================
+The public API intentionally matches the original database module so existing
+routes and CSV import code can evolve without changing every caller at once.
 """
 
-import pymysql
+from __future__ import annotations
+
 from contextlib import contextmanager
-from backend.config import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
+from decimal import Decimal
+from datetime import date, datetime
+from typing import Any
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Connection
+
+from backend.config import DATABASE_URL
 
 
-# ---------------------------------------------------------------------------
-# 连接管理
-# ---------------------------------------------------------------------------
-
-
-def _create_connection() -> pymysql.Connection:
-    """
-    创建到 MySQL 的新连接
-
-    使用 DictCursor 以便查询结果包含列名信息，
-    execute_sql() 依赖此特性来提取 columns 列表
-    """
-    conn = pymysql.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        database=DB_NAME,
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor,
-    )
-    # 显式设置连接字符集，与数据库端 utf8mb4 保持一致
-    with conn.cursor() as cur:
-        cur.execute("SET NAMES utf8mb4")
-    return conn
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    future=True,
+)
 
 
 @contextmanager
 def get_connection():
-    """
-    数据库连接上下文管理器
-
-    用法:
-        with get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT ...")
-
-    退出上下文时自动关闭连接，即使发生异常也会保证关闭
-    """
-    conn = _create_connection()
-    try:
+    with engine.begin() as conn:
         yield conn
-    finally:
-        conn.close()
 
 
-# ---------------------------------------------------------------------------
-# DDL 元数据提取 — 整个系统的"外挂知识库"
-# ---------------------------------------------------------------------------
+def quote_identifier(identifier: str) -> str:
+    if not identifier or "\x00" in identifier:
+        raise ValueError("Invalid SQL identifier")
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return value
+
+
+def _run_select(conn: Connection, sql: str, params: dict | None = None) -> list[dict]:
+    result = conn.execute(text(sql), params or {})
+    return [dict(row._mapping) for row in result]
+
+
+def get_table_names(include_system: bool = False) -> list[str]:
+    sql = """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_type = 'BASE TABLE'
+        ORDER BY table_name
+    """
+    with get_connection() as conn:
+        tables = [row["table_name"] for row in _run_select(conn, sql)]
+    if include_system:
+        return tables
+    return [t for t in tables if not t.startswith("knowledge_")]
 
 
 def get_ddl() -> str:
-    """
-    提取当前数据库中所有用户表的 CREATE TABLE 语句
-
-    这是系统的核心"元数据外挂"机制:
-    - 大模型不知道你的数据库长什么样
-    - 每次查询前动态获取 DDL 注入 Prompt
-    - 模型根据真实表结构生成 SQL，不会瞎猜字段名
-
-    返回:
-        所有表的 CREATE TABLE 语句，用空行分隔
-        示例:
-            CREATE TABLE `orders` (
-              `order_id` int NOT NULL AUTO_INCREMENT,
-              ...
-            )
-
-            CREATE TABLE `products` (
-              `product_id` int NOT NULL AUTO_INCREMENT,
-              ...
-            )
+    """Return PostgreSQL-style CREATE TABLE metadata for LLM context."""
+    sql = """
+        SELECT
+            c.table_name,
+            c.column_name,
+            c.data_type,
+            c.character_maximum_length,
+            c.numeric_precision,
+            c.numeric_scale,
+            c.is_nullable,
+            c.column_default,
+            obj_description(format('%I.%I', c.table_schema, c.table_name)::regclass) AS table_comment,
+            col_description(format('%I.%I', c.table_schema, c.table_name)::regclass::oid, c.ordinal_position) AS column_comment
+        FROM information_schema.columns c
+        WHERE c.table_schema = 'public'
+        ORDER BY c.table_name, c.ordinal_position
     """
     with get_connection() as conn:
-        with conn.cursor() as cursor:
-            # 获取当前库中所有用户表名
-            cursor.execute("SHOW TABLES")
-            table_key = f"Tables_in_{DB_NAME}"
-            tables = [row[table_key] for row in cursor.fetchall()]
+        rows = _run_select(conn, sql)
 
-            ddl_parts: list[str] = []
-            for table_name in tables:
-                cursor.execute(f"SHOW CREATE TABLE `{table_name}`")
-                row = cursor.fetchone()
-                ddl_parts.append(row["Create Table"])
-                ddl_parts.append("")  # 空行分隔不同表的 DDL
+    grouped: dict[str, list[dict]] = {}
+    comments: dict[str, str | None] = {}
+    for row in rows:
+        table_name = row["table_name"]
+        if table_name.startswith("knowledge_"):
+            continue
+        grouped.setdefault(table_name, []).append(row)
+        comments[table_name] = row.get("table_comment")
 
-            return "\n".join(ddl_parts).strip()
+    ddl_parts: list[str] = []
+    for table_name, columns in grouped.items():
+        ddl_parts.append(f'CREATE TABLE "{table_name}" (')
+        col_lines = []
+        for col in columns:
+            data_type = _format_pg_type(col)
+            nullable = "NOT NULL" if col["is_nullable"] == "NO" else "NULL"
+            default = f" DEFAULT {col['column_default']}" if col.get("column_default") else ""
+            comment = f" -- {col['column_comment']}" if col.get("column_comment") else ""
+            col_lines.append(
+                f'  "{col["column_name"]}" {data_type} {nullable}{default}{comment}'
+            )
+        ddl_parts.append(",\n".join(col_lines))
+        table_comment = f" -- {comments.get(table_name)}" if comments.get(table_name) else ""
+        ddl_parts.append(f");{table_comment}\n")
+    return "\n".join(ddl_parts).strip()
 
 
-# ---------------------------------------------------------------------------
-# SQL 执行 — 只执行已校验的 SELECT
-# ---------------------------------------------------------------------------
+def _format_pg_type(col: dict) -> str:
+    data_type = col["data_type"]
+    if data_type == "character varying" and col.get("character_maximum_length"):
+        return f'VARCHAR({col["character_maximum_length"]})'
+    if data_type == "numeric" and col.get("numeric_precision"):
+        scale = col.get("numeric_scale") or 0
+        return f'NUMERIC({col["numeric_precision"]},{scale})'
+    if data_type == "timestamp with time zone":
+        return "TIMESTAMPTZ"
+    if data_type == "timestamp without time zone":
+        return "TIMESTAMP"
+    return data_type.upper()
 
 
 def execute_sql(sql: str) -> dict:
-    """
-    执行已通过安全校验的 SELECT 语句
-
-    参数:
-        sql: 已校验的 SELECT SQL 语句
-
-    返回:
-        {
-            "columns":   ["category", "total_sales"],   # 列名列表
-            "data":      [["水果", 1500], ["蔬菜", 800]], # 数据行
-            "row_count": 2                                # 行数
-        }
-
-    注意:
-        此函数假定 SQL 已经通过 sql_guard.validate_sql() 校验，
-        调用方应确保先校验再执行
-    """
     with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(sql)
-            rows = cursor.fetchall()
-
-            # 无结果时返回空结构
-            if not rows:
-                return {
-                    "columns": [],
-                    "data": [],
-                    "row_count": 0,
-                }
-
-            # DictCursor 返回的每行是 dict，keys() 就是列名
-            columns = list(rows[0].keys())
-
-            # 将 dict 列表转为二维数组（前端更喜欢数组格式）
-            data = [[row[col] for col in columns] for row in rows]
-
-            return {
-                "columns": columns,
-                "data": data,
-                "row_count": len(data),
-            }
-
-
-# ---------------------------------------------------------------------------
-# DDL / 写操作 — CSV 导入专用（不经过 sql_guard，SQL由服务端构造）
-# ---------------------------------------------------------------------------
+        rows = _run_select(conn, sql)
+    if not rows:
+        return {"columns": [], "data": [], "row_count": 0}
+    columns = list(rows[0].keys())
+    data = [[_json_value(row[col]) for col in columns] for row in rows]
+    return {"columns": columns, "data": data, "row_count": len(data)}
 
 
 def execute_ddl(sql: str) -> None:
-    """
-    执行 DDL 语句（CREATE TABLE / DROP TABLE 等）
-
-    ⚠️ 仅用于 CSV 导入流程，SQL 由 csv_importer 模块在服务端构造，
-    不经过 sql_guard 校验。调用方必须确保 SQL 安全。
-
-    参数:
-        sql: DDL SQL 语句
-    """
     with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(sql)
-            conn.commit()
+        conn.execute(text(sql))
 
 
-def execute_insert(sql: str, rows: list[tuple]) -> int:
-    """
-    批量执行参数化 INSERT 语句
-
-    使用 PyMySQL 的 executemany + 参数化查询，
-    值从不拼接到 SQL 字符串中，防止注入。
-
-    参数:
-        sql:  INSERT SQL 语句（包含 %s 占位符）
-        rows: 参数元组列表
-
-    返回:
-        插入的总行数
-    """
+def execute_insert(sql: str, rows: list[dict]) -> int:
+    if not rows:
+        return 0
     with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.executemany(sql, rows)
-            conn.commit()
-            return cursor.rowcount
+        result = conn.execute(text(sql), rows)
+        return result.rowcount or len(rows)
 
 
 def table_exists(table_name: str) -> bool:
-    """
-    检查指定表是否存在于当前数据库中
-
-    参数:
-        table_name: 表名
-
-    返回:
-        True 如果表存在
+    sql = """
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = :table_name
     """
     with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("SHOW TABLES LIKE %s", (table_name,))
-            return cursor.fetchone() is not None
+        return conn.execute(text(sql), {"table_name": table_name}).first() is not None
 
 
 def drop_table(table_name: str) -> None:
-    """
-    删除指定的表
-
-    安全限制：仅允许删除 csv_ 前缀的表（导入表），
-    防止误删原始数据表（orders / products）。
-
-    参数:
-        table_name: 表名
-
-    异常:
-        ValueError: 尝试删除非 csv_ 前缀的表
-    """
     if not table_name.startswith("csv_"):
         raise ValueError(
-            f"安全限制：不允许删除非导入表 '{table_name}'。"
-            "只有 csv_ 前缀的导入表可以被删除。"
+            f"安全限制：不允许删除非导入表 '{table_name}'。只有 csv_ 前缀的导入表可以被删除。"
         )
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(f"DROP TABLE IF EXISTS `{table_name}`")
-            conn.commit()
+    execute_ddl(f"DROP TABLE IF EXISTS {quote_identifier(table_name)}")

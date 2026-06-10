@@ -9,7 +9,7 @@ import { useState } from "react";
  *   - Enter 键快捷提交
  *   - 加载状态下禁用交互
  */
-export default function QueryInput({ onQuery, loading }) {
+export default function QueryInput({ onQuery, loading, targetTable }) {
   const [question, setQuestion] = useState("");
 
   const handleSubmit = (e) => {
@@ -27,12 +27,20 @@ export default function QueryInput({ onQuery, loading }) {
     }
   };
 
-  const suggestions = [
-    "每种商品类别的总销售额是多少？",
-    "每天的订单总金额趋势？",
-    "哪些用户下单最多？",
-    "各类别商品的库存情况？",
-  ];
+  const suggestions = targetTable
+    ? [
+        "这个表按月份有什么变化？",
+        "哪个类别的数量最多？",
+        "为什么销售额下降？",
+        "哪些字段缺失比较严重？",
+        "这个表里有什么异常数据？",
+      ]
+    : [
+        "本月销售额为什么下降？",
+        "哪些地区拖累了整体利润？",
+        "哪些渠道 ROI 变差？",
+        "哪些商品退款率异常升高？",
+      ];
 
   return (
     <div className="query-section">
@@ -40,7 +48,7 @@ export default function QueryInput({ onQuery, loading }) {
         <input
           type="text"
           className="query-input"
-          placeholder="输入自然语言问题，例如：每种商品类别的销售额排名？"
+          placeholder={targetTable ? `针对 ${targetTable} 提问，例如：这个表按月份有什么变化？` : "输入业务问题，例如：本月销售额为什么下降？"}
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
           disabled={loading}
